@@ -36,6 +36,7 @@ on:
         required: false
         default: false
         type: boolean
+        
 permissions:
   contents: write
 
