@@ -1,0 +1,392 @@
+name: Build GKI Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: "Select build variant"
+        required: true
+        default: "RedPanda"
+        type: choice
+        options:
+          - Testing
+          - RedPanda
+      kernelsu_variant:
+        description: "Select kernelsu variant"
+        required: true
+        default: "FinaSU"
+        type: choice
+        options:
+          - FinaSU
+          - BakaSU
+      clang_choice:
+        description: "Select Clang toolchain"
+        required: true
+        default: "Neutron"
+        type: choice
+        options:
+          - Neutron
+      telegram_notify:
+        description: 'Send Telegram notification'
+        required: true
+        type: boolean
+        default: true
+      github_release:
+        description: 'Create GitHub Release'
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: write
+
+env:
+  TZ: 'Asia/Jakarta'
+  KERNEL_REPO_TEST: https://github.com/anakayambakar/kernel
+  KERNEL_REPO_REDPANDA: https://${{ secrets.KERNEL_REPO_TOKEN }}@github.com/Artecxyz/RedPanda-kernel.git
+  KERNEL_DEFCONFIG: redpanda_defconfig
+  KBUILD_BUILD_USER: Artecxyz
+  KBUILD_BUILD_HOST: users
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CCACHE_MAXSIZE: 10G
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Record build start
+        run: echo "BUILD_START=$(date +%s)" >> $GITHUB_ENV
+        
+      - name: 🧠 Add swap space (for LTO link)
+        run: |
+          sudo fallocate -l 16G /mnt/swap_lto || sudo dd if=/dev/zero of=/mnt/swap_lto bs=1M count=16384
+          sudo chmod 600 /mnt/swap_lto
+          sudo mkswap /mnt/swap_lto
+          sudo swapon /mnt/swap_lto
+          echo "── swap after ──"; free -h
+          
+      - name: ⬇️ Clone kernel source
+        run: |
+          if [ "${{ github.event.inputs.build_variant }}" = "Testing" ]; then
+            git clone --depth=1 "$KERNEL_REPO_TEST" kernel_workspace
+          else
+            git clone --depth=1 "$KERNEL_REPO_REDPANDA" kernel_workspace
+          fi
+          cd kernel_workspace
+          KERNEL_VERSION=$(grep '^VERSION =' Makefile | sed 's/.*= //')
+          KERNEL_PATCHLEVEL=$(grep '^PATCHLEVEL =' Makefile | sed 's/.*= //')
+          KERNEL_SUBLEVEL=$(grep '^SUBLEVEL =' Makefile | sed 's/.*= //')
+          echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
+          echo "KERNEL_PATCHLEVEL=$KERNEL_PATCHLEVEL" >> $GITHUB_ENV
+          echo "KERNEL_SUBLEVEL=$KERNEL_SUBLEVEL" >> $GITHUB_ENV
+          echo "KERNEL_VER=$KERNEL_VERSION.$KERNEL_PATCHLEVEL" >> $GITHUB_ENV
+          echo "KERNEL_FULL_VERSION=$KERNEL_VERSION.$KERNEL_PATCHLEVEL.$KERNEL_SUBLEVEL" >> $GITHUB_ENV
+          echo "KERNEL_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "KERNEL_COMMIT_FULL=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          echo "KERNEL_BRANCH=$(git rev-parse --abbrev-ref HEAD)" >> $GITHUB_ENV
+
+      - name: ⚙️ Configure CCache Directory
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache_${{ env.KERNEL_FULL_VERSION }}" >> $GITHUB_ENV
+          echo "LDCACHE_DIR=$GITHUB_WORKSPACE/ldcache_${{ env.KERNEL_FULL_VERSION }}" >> $GITHUB_ENV
+          mkdir -p $GITHUB_WORKSPACE/ldcache_${{ env.KERNEL_FULL_VERSION }}
+
+      - name: 💾 Restore APT Cache
+        id: apt-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.apt-pkg-cache
+          key: apt-cache-${{ runner.os }}-${{ env.KERNEL_VER }}
+
+      - name: 📦 Install Dependencies
+        run: |
+          export APT_PACKAGES="python3 git curl ccache libelf-dev build-essential flex bison libssl-dev libncurses-dev liblz4-tool zlib1g-dev libxml2-utils rsync unzip gawk dos2unix kmod libdw-dev elfutils dwarves"
+          bash "$GITHUB_WORKSPACE/scripts/cache_apt_pkgs.sh" ~/.apt-pkg-cache
+          
+      - name: 💾 Cache Clang toolchain
+        id: clang-cache
+        uses: actions/cache@v6
+        with:
+          path: toolchains/clang
+          key: clang-${{ github.event.inputs.clang_choice }}
+
+      - name: ⬇️ Download & Setup Clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p toolchains/clang && cd toolchains/clang
+          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S
+
+      - name: 💾 Restore Cache
+        id: restore-ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ github.event.inputs.kernelsu_variant }}-${{ github.event.inputs.clang_choice }}-${{ env.KERNEL_FULL_VERSION }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ github.event.inputs.kernelsu_variant }}-${{ github.event.inputs.clang_choice }}-
+
+      - name: 💾 Restore ThinLTO Cache
+        id: restore-thinlto
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.LDCACHE_DIR }}
+          key: thinlto-cache-${{ runner.os }}-${{ env.KERNEL_FULL_VERSION }}
+          restore-keys: |
+            thinlto-cache-${{ runner.os }}-
+            
+      - name: ⚙️ Initialize Ccache
+        run: |
+          INIT_FLAG="${{ env.CCACHE_DIR }}/.ccache_initialized"
+          if command -v ccache >/dev/null 2>&1; then
+            if [ ! -f "$INIT_FLAG" ]; then
+              echo "Initializing ccache (${{ env.CCACHE_DIR }})..."
+              mkdir -p "${{ env.CCACHE_DIR }}"
+              ccache -M ${{ env.CCACHE_MAXSIZE }}
+              ccache -o compression=true
+              ccache -o compiler_check=none
+              ccache -o hash_dir=false
+              ccache -o direct_mode=true
+              ccache -o depend_mode=false
+              ccache -o base_dir="${{ github.workspace }}"
+              ccache -o sloppiness=file_stat_matches,include_file_ctime,include_file_mtime,pch_defines,file_macro,time_macros,locale
+              touch "$INIT_FLAG"
+              echo "✅ ccache initialization complete"
+            else
+              echo "✅ ccache already initialized, skipping."
+            fi
+          else
+            echo "❌ ccache not installed, skipping."
+          fi
+
+          echo "Initial CCache status:"
+          ccache -s
+
+          echo "Updating atime to achieve cache eviction..."
+          find "${{ env.CCACHE_DIR }}" -type f -exec touch -t $(date -d "1 day ago" +%Y%m%d%H%M) {} + || true
+
+      - name: ⚡ Setup KernelSU
+        working-directory: kernel_workspace
+        run: |
+          if [ "${{ github.event.inputs.kernelsu_variant }}" = "FinaSU" ]; then
+            echo "🛠️ Setting up FinaSU (master branch)..."
+            curl -LSs "https://raw.githubusercontent.com/LyraVoid/FinaSU/refs/heads/master/kernel/setup.sh" | bash -s master
+            cd FinaSU
+
+            KSU_VERSION=$(expr $(git rev-list --count HEAD) + 30700 2>/dev/null || echo 114514)
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "✅ FinaSU $(git rev-parse --short HEAD) (ver $KSU_VERSION)"
+            
+          elif [ "${{ github.event.inputs.kernelsu_variant }}" = "BakaSU" ]; then
+            echo "🛠️ Setting up BakaSU (main branch)..."
+            curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main
+            cd KernelSU
+            
+            KSNEXT_COMPAT_PATCH="$GITHUB_WORKSPACE/patches/bakasu_ksunext_compat.patch"
+            if [ -f "$KSNEXT_COMPAT_PATCH" ]; then
+              patch -p1 < "$KSNEXT_COMPAT_PATCH"
+              echo "✅ KSU-Next manager compat applied"
+            else
+              echo "::warning::KSU-Next compat patch not found at $KSNEXT_COMPAT_PATCH — skipping"
+            fi
+            
+            KSU_VERSION=$(expr $(git rev-list --count HEAD) + 30700 2>/dev/null || echo 114514)
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "✅ BakaSU $(git rev-parse --short HEAD) (ver $KSU_VERSION)"
+
+            MM_PATCH="$GITHUB_WORKSPACE/patches/more_multi_manager.patch"
+            if [ -f "$MM_PATCH" ]; then
+              patch -p1 -F 3 < "$MM_PATCH"
+              echo "✅ Add More Multi-Manager List"
+            else
+              echo "::warning::File Patch not found at $MM_PATCH — skipping"
+            fi
+            sed -i 's/-dirty//g' kernel/Kbuild
+          else
+            echo "❌ Unrecognized variant: ${{ github.event.inputs.kernelsu_variant }}"
+            exit 1
+          fi
+          KSU_TAG="$(git describe --tags 2>/dev/null || git rev-parse --short HEAD)"
+          echo "KSU_TAG=${KSU_TAG}" >> $GITHUB_ENV
+          echo "✅ KSU tag: ${KSU_TAG}"
+          
+      - name: 🔧 Setup Patches (SUSFS)
+        working-directory: kernel_workspace
+        run: |
+          git clone --depth=1 https://github.com/Artecxyz/susfs4ksu.git -b gki-android15-6.6
+          
+          cp susfs4ksu/kernel_patches/fs/* ./fs/
+          cp susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+          cp susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch ./
+          
+          patch -p1 < 50_add_susfs_in_gki-android15-6.6.patch || true
+          if grep -q "SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))" fs/proc/task_mmu.c 2>/dev/null; then
+            echo "✅ SUSFS setup complete"
+          else
+            echo "⚠️  SUS_MAP guard not found — patch may need adjustment"
+          fi
+
+      - name: ⚙️ Configure Kernel Options
+        working-directory: kernel_workspace
+        run: |
+          DEFCONFIG="./arch/arm64/configs/$KERNEL_DEFCONFIG"
+          if [ ! -f "$DEFCONFIG" ]; then
+            echo "ERROR: $DEFCONFIG not found"
+            exit 1
+          fi
+
+          set_config() {
+            local key="$1"
+            local value="$2"
+            sed -i "/^${key}=/d" "$DEFCONFIG"
+            sed -i "/^# ${key} is not set/d" "$DEFCONFIG"
+            echo "${key}=${value}" >> "$DEFCONFIG"
+          
+            if grep -Fxq "${key}=${value}" "$DEFCONFIG"; then
+              echo "${key}=${value} (✅ SUCCESS)"
+            else
+              echo "${key}=${value} (❌ FAILED)" >&2
+              return 1
+            fi
+          }
+          
+          set_config CONFIG_KSU y
+          set_config CONFIG_KSU_SUSFS y
+          set_config CONFIG_KALLSYMS y
+          set_config CONFIG_KALLSYMS_ALL y
+          
+          if [ "${{ github.event.inputs.kernelsu_variant }}" = "FinaSU" ]; then
+            set_config CONFIG_KSU_HOOK_SUSFS_INLINE y
+          fi
+          
+          sed -i 's/check_defconfig//' "$KERNEL_ROOT/build.config.gki" 2>/dev/null || true
+          echo "Kernel configs enabled in $KERNEL_DEFCONFIG"
+          
+      - name: 🔨 Build Kernel
+        working-directory: kernel_workspace
+        run: |
+          export MAP="-fdebug-prefix-map=${GITHUB_WORKSPACE}=. -fmacro-prefix-map=${GITHUB_WORKSPACE}=. -ffile-prefix-map=${GITHUB_WORKSPACE}=."
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+          export KBUILD_BUILD_USER=$KBUILD_BUILD_USER
+          export KBUILD_BUILD_HOST=$KBUILD_BUILD_HOST
+
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          export CCACHE_LOGFILE="${{ github.workspace }}/kernel_workspace/ccache.log"
+          export CCACHE_IS_KERNEL_COMPILING=true
+          
+          CLANG_DIR="$GITHUB_WORKSPACE/toolchains/clang/bin"
+          echo "Clang:  $($CLANG_DIR/clang --version | head -n 1)"
+          echo "LLD:    $($CLANG_DIR/ld.lld --version | head -n 1)"
+          echo "PAHOLE: $(pahole --version 2>/dev/null)" || echo "PAHOLE: Not Installed"
+          
+          mkdir -p $GITHUB_WORKSPACE/kout
+          mkdir -p "$LDCACHE_DIR"
+
+          echo '#!/bin/bash' > ld-wrapper
+          echo 'ld.lld "$@" --thinlto-cache-dir=$LDCACHE_DIR --thinlto-jobs=$(($(nproc --all) / 2))' >> ld-wrapper
+          chmod +x ld-wrapper
+          
+          make -j$(nproc --all) LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache gcc" \
+            LD="$(pwd)/ld-wrapper" HOSTLD="$(pwd)/ld-wrapper" O=$GITHUB_WORKSPACE/kout \
+            KCFLAGS="-pipe -Wno-error -Wno-implicit-function-declaration -Wno-implicit-int -Wno-default-const-init-var-unsafe -Wno-format -Wno-unknown-warning-option" \
+            $KERNEL_DEFCONFIG || { echo "make defconfig failed"; exit 1; }
+
+          make -j$(nproc --all) LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache gcc" \
+            LD="$(pwd)/ld-wrapper" HOSTLD="$(pwd)/ld-wrapper" O=$GITHUB_WORKSPACE/kout \
+            KCFLAGS="-pipe -Wno-error -Wno-implicit-function-declaration -Wno-implicit-int -Wno-default-const-init-var-unsafe -Wno-format -Wno-unknown-warning-option" \
+            Image || { echo "make Image failed"; exit 1; }
+
+          echo "Kernel Compilation Complete!"
+          ccache -c
+          ccache --evict-older-than 10800s
+          echo "CCache Status:"
+          ccache -s
+          df -h
+
+      - name: 📦 Make AnyKernel3
+        working-directory: kernel_workspace
+        run: |
+          git clone --depth=1 https://github.com/Artecxyz/AnyKernel3.git
+          rm -rf ./AnyKernel3/.git
+          cd AnyKernel3
+          cp $GITHUB_WORKSPACE/kout/arch/arm64/boot/Image ./Image
+          if [ ! -f ./Image ]; then
+            echo "Kernel Image not found, build may have failed."
+            exit 1
+          fi
+          gzip -n -f -9 ./Image
+          ZIP_NAME=RedPanda-GKI-${{ github.event.inputs.kernelsu_variant }}-$(date +%Y%m%d-%H%M).zip
+          zip -r9 "../$ZIP_NAME" ./*
+
+      - name: 📤 Upload zip artifact
+        if: github.event.inputs.kernelsu_variant != 'none' && github.event.inputs.github_release != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: RedPanda-GKI-${{ github.event.inputs.kernelsu_variant }}
+          path: kernel_workspace/RedPanda-GKI-${{ github.event.inputs.kernelsu_variant }}-*.zip
+          retention-days: 7
+
+      - name: 📤 Upload to GitHub Release
+        if: github.event.inputs.github_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.kernelsu_variant }}-${{ env.KSUVER }}
+          name: RedPanda GKI ${{ github.event.inputs.kernelsu_variant }} v${{ env.KSUVER }} - ${{ env.KERNEL_FULL_VERSION }}
+          files: kernel_workspace/*.zip
+
+      - name: 📨 Send Telegram (simple)
+        if: github.event.inputs.telegram_notify == 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          MESSAGE_THREAD_ID: ${{ secrets.MESSAGE_THREAD_ID }}
+        run: |
+          BUILD_END=$(date +%s)
+          BUILD_DUR=$((BUILD_END - BUILD_START))
+          BUILD_MIN=$((BUILD_DUR / 60))
+          BUILD_SEC=$((BUILD_DUR % 60))
+
+          cat > /tmp/tg_caption.html <<EOF
+          <b>Kernel Build Successful!</b>
+
+          <b>👤 Author:</b> @Artecxyz
+          <b>📆 Build Time:</b> $(date "+%H:%M:%S - %d/%m/%Y")
+          <b>🕒 Build Speed:</b> ${BUILD_MIN} minutes ${BUILD_SEC} second
+          <b>📦 Variant:</b> ${{ github.event.inputs.kernelsu_variant }} (ver ${{ env.KSUVER }})
+          <b>🌐 Kernel version:</b> ${{ env.KERNEL_FULL_VERSION }}
+          <b>🔧 Toolchain:</b> ${{ github.event.inputs.clang_choice }} Clang
+          EOF
+
+          ZIP_PATH=$(ls kernel_workspace/RedPanda-GKI-*.zip 2>/dev/null | head -n 1)
+          if [ -z "$ZIP_PATH" ]; then
+            echo "⚠️ ZIP not found, skipping upload."
+            exit 0
+          fi
+          echo "📦 File: $ZIP_PATH ($(du -h "$ZIP_PATH" | cut -f1))"
+
+          curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+            -F chat_id="${CHAT_ID}" \
+            -F message_thread_id="${MESSAGE_THREAD_ID}" \
+            -F document=@"${ZIP_PATH}" \
+            -F caption="</tmp/tg_caption.html" \
+            -F parse_mode="HTML"
+
+      - name: 📦 Save Cache
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ github.event.inputs.kernelsu_variant }}-${{ github.event.inputs.clang_choice }}-${{ env.KERNEL_FULL_VERSION }}
+
+      - name: 📦 Save ThinLTO Cache
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.LDCACHE_DIR }}
+          key: thinlto-cache-${{ runner.os }}-${{ env.KERNEL_FULL_VERSION }}
+
